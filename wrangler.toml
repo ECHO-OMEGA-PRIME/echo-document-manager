@@ -1,0 +1,27 @@
+name = "echo-document-manager"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[triggers]
+crons = ["0 4 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-document-manager"
+database_id = "bf256709-9e34-4619-b98b-aad46d1fb1ea"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "58846567a69c4466860230e4279bd16b"
+
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "echo-prime-storage"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
