@@ -409,6 +409,18 @@ app.post('/ai/auto-tag', async (c) => {
   return c.json(await resp.json().catch(() => ({ error: 'AI tagging failed' })));
 });
 
+app.onError((err, c) => {
+  if (err.message?.includes('JSON')) {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  console.error(`[echo-document-manager] ${err.message}`);
+  return c.json({ error: 'Internal server error' }, 500);
+});
+
+app.notFound((c) => {
+  return c.json({ error: 'Not found' }, 404);
+});
+
 // ── Scheduled ──
 export default {
   fetch: app.fetch,
