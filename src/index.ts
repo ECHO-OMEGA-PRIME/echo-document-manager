@@ -83,7 +83,7 @@ app.use('*', async (c, next) => {
 });
 
 // ── Health ──
-app.get('/', (c) => c.redirect('/health'));
+app.get('/', (c) => c.json({ service: 'echo-document-manager', version: '1.0.0', status: 'operational' }));
 app.get('/health', (c) => c.json({ ok: true, service: 'echo-document-manager', version: '1.0.0', timestamp: new Date().toISOString() }));
 app.get('/status', async (c) => {
   const files = await c.env.DB.prepare('SELECT COUNT(*) as c FROM files WHERE is_archived=0').first<{c:number}>();
