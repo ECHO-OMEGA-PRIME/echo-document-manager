@@ -42,9 +42,15 @@ async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec 
   return true;
 }
 
+function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-document-manager', version: '1.0.0', msg, ...data };
+  if (level === 'error') console.error(JSON.stringify(entry));
+  else console.log(JSON.stringify(entry));
+}
+
 // Global error handler — catches D1 errors and returns structured 500 instead of crashing
 app.onError((err, c) => {
-  console.error(`[echo-document-manager] ${c.req.method} ${c.req.url} error:`, err.message);
+  slog('error', 'Unhandled request error', { method: c.req.method, url: c.req.url, error: err.message, stack: err.stack });
   return c.json({
     error: 'Internal server error',
     message: err.message,
