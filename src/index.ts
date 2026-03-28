@@ -42,6 +42,16 @@ async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec 
   return true;
 }
 
+// Global error handler — catches D1 errors and returns structured 500 instead of crashing
+app.onError((err, c) => {
+  console.error(`[echo-document-manager] ${c.req.method} ${c.req.url} error:`, err.message);
+  return c.json({
+    error: 'Internal server error',
+    message: err.message,
+    path: new URL(c.req.url).pathname,
+  }, 500);
+});
+
 // CORS
 app.use('*', cors());
 
