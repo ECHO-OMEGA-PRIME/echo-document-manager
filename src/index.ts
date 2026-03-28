@@ -8,6 +8,8 @@ type Env = {
   ECHO_API_KEY: string;
   ENGINE_RUNTIME: Fetcher;
   SHARED_BRAIN: Fetcher;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
 };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -43,9 +45,60 @@ async function rateLimit(kv: KVNamespace, key: string, limit: number, windowSec 
 }
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-document-manager', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-document-manager', version: '2.0.0', msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
+}
+
+// ── Plan Definitions ──
+const PLAN_CONFIG: Record<string, { storage_mb: number; max_files: number; price_cents: number; stripe_price_id?: string }> = {
+  free:       { storage_mb: 100,     max_files: 50,    price_cents: 0 },
+  starter:    { storage_mb: 1024,    max_files: 500,   price_cents: 999 },
+  pro:        { storage_mb: 10240,   max_files: 5000,  price_cents: 2999 },
+  enterprise: { storage_mb: 102400,  max_files: 999999, price_cents: 9999 },
+};
+
+// ── Stripe Helpers ──
+async function stripeRequest(secretKey: string, path: string, method: string, body?: URLSearchParams): Promise<any> {
+  const resp = await fetch(`https://api.stripe.com/v1${path}`, {
+    method,
+    headers: {
+      'Authorization': `Bearer ${secretKey}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: body?.toString(),
+  });
+  return resp.json();
+}
+
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  const parts = sigHeader.split(',');
+  let timestamp = '';
+  const signatures: string[] = [];
+  for (const part of parts) {
+    const [k, v] = part.split('=');
+    if (k === 't') timestamp = v;
+    if (k === 'v1') signatures.push(v);
+  }
+  if (!timestamp || signatures.length === 0) return false;
+
+  // Replay protection: reject signatures older than 5 minutes
+  const age = Math.abs(Date.now() / 1000 - parseInt(timestamp));
+  if (age > 300) return false;
+
+  const signedPayload = `${timestamp}.${payload}`;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
+  const expectedHex = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  // Constant-time compare
+  if (expectedHex.length !== signatures[0].length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < expectedHex.length; i++) {
+    mismatch |= expectedHex.charCodeAt(i) ^ signatures[0].charCodeAt(i);
+  }
+  return mismatch === 0;
 }
 
 // Global error handler — catches D1 errors and returns structured 500 instead of crashing
@@ -66,6 +119,7 @@ app.use('*', async (c, next) => {
   const path = new URL(c.req.url).pathname;
   if (path === '/health' || path === '/status') return next();
   if (path.startsWith('/shared/')) return next(); // Public share links
+  if (path === '/webhooks/stripe') return next(); // Stripe webhook (signature-verified)
   if (c.req.method === 'GET') return next();
   const key = c.req.header('X-Echo-API-Key') || c.req.header('Authorization')?.replace('Bearer ', '');
   if (!key || key !== c.env.ECHO_API_KEY) return c.json({ error: 'Unauthorized' }, 401);
@@ -83,8 +137,12 @@ app.use('*', async (c, next) => {
 });
 
 // ── Health ──
-app.get('/', (c) => c.json({ service: 'echo-document-manager', version: '1.0.0', status: 'operational' }));
-app.get('/health', (c) => c.json({ ok: true, service: 'echo-document-manager', version: '1.0.0', timestamp: new Date().toISOString() }));
+app.get('/', (c) => c.json({ service: 'echo-document-manager', version: '2.0.0', status: 'operational' }));
+app.get('/health', (c) => c.json({
+  ok: true, service: 'echo-document-manager', version: '2.0.0', timestamp: new Date().toISOString(),
+  stripe: { configured: !!c.env.STRIPE_SECRET_KEY, webhook_configured: !!c.env.STRIPE_WEBHOOK_SECRET },
+  plans: Object.keys(PLAN_CONFIG),
+}));
 app.get('/status', async (c) => {
   const files = await c.env.DB.prepare('SELECT COUNT(*) as c FROM files WHERE is_archived=0').first<{c:number}>();
   const folders = await c.env.DB.prepare('SELECT COUNT(*) as c FROM folders').first<{c:number}>();
@@ -434,6 +492,195 @@ app.post('/ai/auto-tag', async (c) => {
     body: JSON.stringify({ engine_id: 'GEN-01', query: `Suggest 5-8 tags for this file based on its name, type, and description. Name: ${file.name}, Type: ${file.extension}, Description: ${file.description || 'none'}. Return JSON array of tag strings.` }),
   });
   return c.json(await resp.json().catch(() => ({ error: 'AI tagging failed' })));
+});
+
+// ── Stripe: Create Checkout Session ──
+app.post('/plans/upgrade', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 503);
+  const b = await c.req.json() as { tenant_id: string; plan: string; success_url?: string; cancel_url?: string };
+  const plan = PLAN_CONFIG[b.plan];
+  if (!plan || b.plan === 'free') return c.json({ error: 'Invalid plan. Choose: starter, pro, enterprise' }, 400);
+
+  const tenant = await c.env.DB.prepare('SELECT * FROM tenants WHERE id=?').bind(b.tenant_id).first<any>();
+  if (!tenant) return c.json({ error: 'Tenant not found' }, 404);
+  if (tenant.plan === b.plan) return c.json({ error: 'Already on this plan' }, 400);
+
+  // If tenant already has a Stripe customer ID, use it; otherwise create one
+  let customerId = tenant.stripe_customer_id;
+  if (!customerId) {
+    const customer = await stripeRequest(c.env.STRIPE_SECRET_KEY, '/customers', 'POST', new URLSearchParams({
+      'metadata[tenant_id]': b.tenant_id,
+      'name': tenant.name || b.tenant_id,
+    }));
+    customerId = customer.id;
+    await c.env.DB.prepare('UPDATE tenants SET stripe_customer_id=? WHERE id=?').bind(customerId, b.tenant_id).run();
+  }
+
+  // Create a Stripe Checkout session
+  const params = new URLSearchParams({
+    'customer': customerId,
+    'mode': 'subscription',
+    'success_url': b.success_url || 'https://echo-op.com/dashboard?upgrade=success',
+    'cancel_url': b.cancel_url || 'https://echo-op.com/dashboard?upgrade=cancelled',
+    'metadata[tenant_id]': b.tenant_id,
+    'metadata[plan]': b.plan,
+    'line_items[0][price_data][currency]': 'usd',
+    'line_items[0][price_data][recurring][interval]': 'month',
+    'line_items[0][price_data][unit_amount]': plan.price_cents.toString(),
+    'line_items[0][price_data][product_data][name]': `Document Manager — ${b.plan.charAt(0).toUpperCase() + b.plan.slice(1)} Plan`,
+    'line_items[0][quantity]': '1',
+  });
+
+  const session = await stripeRequest(c.env.STRIPE_SECRET_KEY, '/checkout/sessions', 'POST', params);
+  if (session.error) {
+    slog('error', 'Stripe checkout creation failed', { error: session.error });
+    return c.json({ error: 'Stripe checkout failed', detail: session.error.message }, 500);
+  }
+
+  slog('info', 'Checkout session created', { tenant_id: b.tenant_id, plan: b.plan, session_id: session.id });
+  return c.json({ checkout_url: session.url, session_id: session.id });
+});
+
+// ── Stripe: Get billing portal link ──
+app.post('/plans/portal', async (c) => {
+  if (!c.env.STRIPE_SECRET_KEY) return c.json({ error: 'Stripe not configured' }, 503);
+  const b = await c.req.json() as { tenant_id: string; return_url?: string };
+  const tenant = await c.env.DB.prepare('SELECT stripe_customer_id FROM tenants WHERE id=?').bind(b.tenant_id).first<any>();
+  if (!tenant?.stripe_customer_id) return c.json({ error: 'No billing account found' }, 404);
+
+  const portal = await stripeRequest(c.env.STRIPE_SECRET_KEY, '/billing_portal/sessions', 'POST', new URLSearchParams({
+    'customer': tenant.stripe_customer_id,
+    'return_url': b.return_url || 'https://echo-op.com/dashboard',
+  }));
+  return c.json({ portal_url: portal.url });
+});
+
+// ── Stripe: Get current plan/subscription info ──
+app.get('/plans/:tenant_id', async (c) => {
+  const tenant = await c.env.DB.prepare('SELECT id,name,plan,max_storage_mb,max_files,used_storage_mb,stripe_customer_id,stripe_subscription_id FROM tenants WHERE id=?').bind(c.req.param('tenant_id')).first<any>();
+  if (!tenant) return c.json({ error: 'Tenant not found' }, 404);
+  const planDef = PLAN_CONFIG[tenant.plan] || PLAN_CONFIG.free;
+  return c.json({
+    tenant_id: tenant.id,
+    plan: tenant.plan,
+    price_cents: planDef.price_cents,
+    limits: { storage_mb: planDef.storage_mb, max_files: planDef.max_files },
+    usage: { storage_mb: tenant.used_storage_mb || 0 },
+    stripe: { customer_id: tenant.stripe_customer_id || null, subscription_id: tenant.stripe_subscription_id || null },
+    available_upgrades: Object.entries(PLAN_CONFIG)
+      .filter(([k]) => k !== tenant.plan && k !== 'free')
+      .map(([k, v]) => ({ plan: k, price_cents: v.price_cents, storage_mb: v.storage_mb, max_files: v.max_files })),
+  });
+});
+
+// ── Stripe Webhook ──
+app.post('/webhooks/stripe', async (c) => {
+  const body = await c.req.text();
+  const sig = c.req.header('Stripe-Signature') || '';
+
+  if (c.env.STRIPE_WEBHOOK_SECRET) {
+    const valid = await verifyStripeSignature(body, sig, c.env.STRIPE_WEBHOOK_SECRET);
+    if (!valid) {
+      slog('warn', 'Stripe webhook signature verification failed');
+      return c.json({ error: 'Invalid signature' }, 401);
+    }
+  }
+
+  const event = JSON.parse(body);
+  slog('info', 'Stripe webhook received', { type: event.type, id: event.id });
+
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      const session = event.data.object;
+      const tenantId = session.metadata?.tenant_id;
+      const plan = session.metadata?.plan;
+      if (tenantId && plan && PLAN_CONFIG[plan]) {
+        const cfg = PLAN_CONFIG[plan];
+        await c.env.DB.prepare('UPDATE tenants SET plan=?, max_storage_mb=?, max_files=?, stripe_customer_id=?, stripe_subscription_id=?, updated_at=datetime(\'now\') WHERE id=?')
+          .bind(plan, cfg.storage_mb, cfg.max_files, session.customer, session.subscription, tenantId).run();
+        slog('info', 'Tenant plan upgraded via checkout', { tenant_id: tenantId, plan });
+
+        // Log activity
+        await c.env.DB.prepare('INSERT INTO recent_activity (tenant_id,action,file_name,performed_by) VALUES (?,\'plan_upgrade\',?,\'stripe\')')
+          .bind(tenantId, `Upgraded to ${plan}`).run();
+      }
+      break;
+    }
+
+    case 'customer.subscription.updated': {
+      const sub = event.data.object;
+      const customerId = sub.customer;
+      const tenant = await c.env.DB.prepare('SELECT id FROM tenants WHERE stripe_customer_id=?').bind(customerId).first<any>();
+      if (tenant) {
+        const status = sub.status;
+        if (status === 'active') {
+          await c.env.DB.prepare('UPDATE tenants SET stripe_subscription_id=?, updated_at=datetime(\'now\') WHERE id=?')
+            .bind(sub.id, tenant.id).run();
+        }
+        slog('info', 'Subscription updated', { tenant_id: tenant.id, status });
+      }
+      break;
+    }
+
+    case 'customer.subscription.deleted': {
+      const sub = event.data.object;
+      const customerId = sub.customer;
+      const tenant = await c.env.DB.prepare('SELECT id FROM tenants WHERE stripe_customer_id=?').bind(customerId).first<any>();
+      if (tenant) {
+        const freeCfg = PLAN_CONFIG.free;
+        await c.env.DB.prepare('UPDATE tenants SET plan=\'free\', max_storage_mb=?, max_files=?, stripe_subscription_id=NULL, updated_at=datetime(\'now\') WHERE id=?')
+          .bind(freeCfg.storage_mb, freeCfg.max_files, tenant.id).run();
+        slog('info', 'Subscription cancelled, downgraded to free', { tenant_id: tenant.id });
+
+        await c.env.DB.prepare('INSERT INTO recent_activity (tenant_id,action,file_name,performed_by) VALUES (?,\'plan_downgrade\',\'Downgraded to free\',\'stripe\')')
+          .bind(tenant.id).run();
+      }
+      break;
+    }
+
+    case 'invoice.payment_failed': {
+      const invoice = event.data.object;
+      const customerId = invoice.customer;
+      const tenant = await c.env.DB.prepare('SELECT id FROM tenants WHERE stripe_customer_id=?').bind(customerId).first<any>();
+      if (tenant) {
+        slog('warn', 'Payment failed', { tenant_id: tenant.id, invoice_id: invoice.id });
+        await c.env.DB.prepare('INSERT INTO recent_activity (tenant_id,action,file_name,performed_by) VALUES (?,\'payment_failed\',\'Payment failed — action required\',\'stripe\')')
+          .bind(tenant.id).run();
+      }
+      break;
+    }
+
+    default:
+      slog('info', 'Unhandled Stripe event type', { type: event.type });
+  }
+
+  return c.json({ received: true });
+});
+
+// ── Admin: Migrate Stripe columns ──
+app.post('/admin/migrate-stripe', async (c) => {
+  const migrations = [
+    `ALTER TABLE tenants ADD COLUMN stripe_customer_id TEXT`,
+    `ALTER TABLE tenants ADD COLUMN stripe_subscription_id TEXT`,
+    `ALTER TABLE tenants ADD COLUMN max_storage_mb REAL DEFAULT 100`,
+    `ALTER TABLE tenants ADD COLUMN max_files INTEGER DEFAULT 50`,
+    `ALTER TABLE tenants ADD COLUMN used_storage_mb REAL DEFAULT 0`,
+  ];
+  const results: { sql: string; status: string }[] = [];
+  for (const sql of migrations) {
+    try {
+      await c.env.DB.prepare(sql).run();
+      results.push({ sql, status: 'applied' });
+    } catch (e: any) {
+      if (e.message?.includes('duplicate column') || e.message?.includes('already exists')) {
+        results.push({ sql, status: 'already_exists' });
+      } else {
+        results.push({ sql, status: `error: ${e.message}` });
+      }
+    }
+  }
+  slog('info', 'Stripe migration executed', { results });
+  return c.json({ migrated: true, results });
 });
 
 app.onError((err, c) => {
